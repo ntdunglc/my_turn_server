@@ -1,0 +1,22 @@
+[package]
+name = "my_turn"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "my_turn"
+path = "src/lib.rs"
+
+[[bin]]
+name = "run_server"
+path = "src/run_server.rs"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+axum = { version = "0.5.16", features = ["ws", "headers"] }
+serde = "1.0"
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+tower-http = { version = "0.3", features = ["fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
