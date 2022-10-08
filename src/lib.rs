@@ -11,14 +11,16 @@ use tower_http::{
     services::ServeDir,
     trace::{DefaultMakeSpan, TraceLayer},
 };
-
+pub mod broker;
 pub mod error;
-pub mod server;
+pub mod room;
+pub mod stats;
+pub mod utils;
 pub mod ws;
 
 pub fn create_app() -> Router {
-    let server_addr = server::Server::start();
-
+    let (broker_addr, _) = broker::Broker::spawn();
+    let broker_addr_2 = broker_addr.clone();
     let assets_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
     Router::new()
         .fallback(
@@ -32,7 +34,8 @@ pub fn create_app() -> Router {
         )
         // routes are matched from bottom to top, so we have to put `nest` at the
         // top since it matches all routes
-        .route("/ws", get(move |ws| ws::ws_handler(ws, server_addr)))
+        .route("/ws", get(move |ws| ws::ws_handler(ws, broker_addr)))
+        .route("/stats", get(move || stats::handler(broker_addr_2)))
         // logging so we can see whats going on
         .layer(
             TraceLayer::new_for_http()

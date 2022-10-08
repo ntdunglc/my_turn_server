@@ -1,109 +1,192 @@
-use crate::server;
+use crate::{
+    broker::{self, BrokerAddr},
+    room::{self, RoomAddr},
+    utils::spawn_and_log_error,
+};
 use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        TypedHeader,
-    },
-    headers,
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
 };
 use futures_util::{
     stream::{SplitSink, SplitStream},
-    FutureExt, SinkExt, StreamExt, TryFutureExt,
+    FutureExt, SinkExt, StreamExt,
 };
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, time::Duration};
-use tokio::sync::mpsc::{self, Sender, UnboundedSender};
+use std::{collections::HashMap, fmt::Debug, time::Duration};
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
 use tokio::sync::oneshot;
-use tokio::time::Instant;
+use tokio::time::{timeout, Instant};
 use tracing::log::{debug, warn};
 pub use usize as SessionId;
 
+const CHANNEL_SIZE: usize = 60;
 /// How often heartbeat pings are sent
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// How long before lack of client response causes a timeout
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(16);
 
-#[derive(Debug)]
-pub struct ClientSession {
-    pub id: SessionId,
-    // pub room_manager: Addr<room_manager::RoomManager>,
-    /// Client must send ping at least once per 10 seconds (CLIENT_TIMEOUT),
-    /// otherwise we drop connection.
-    pub hearbeat: Instant,
-}
-
-#[derive(Serialize, Deserialize)]
+// Input message of ClientSession
+#[derive(Debug, Serialize, Deserialize)]
 pub enum MailboxMessage {
-    // SocketMessage { message: String},
-    CreateRoom { room: String },
-    Vote { room: String },
+    CreateRoom { name: String },
+    // Vote { room: String },
     Chat { room: String, message: String },
 }
 
-// #[derive(Serialize, Deserialize)]
-// pub enum Response {
-//     ClientState { id: SessionId },
-//     // Room { room: Room },
-//     Chat { message: String },
-//     Error { error: String },
+pub type ClientAddr = mpsc::Sender<MailboxMessage>;
+
+// Output message to be sent via websocket
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub enum WsResponse {
+    ClientState { id: SessionId },
+    Room(room::RoomState),
+    // Chat { message: String },
+    Error { error: String },
+}
+
+impl Into<Message> for WsResponse {
+    fn into(self) -> Message {
+        Message::Text(serde_json::to_string(&self).unwrap().into())
+    }
+}
+
+#[derive(Debug)]
+pub struct ClientSession {
+    pub id: SessionId,
+    pub addr: ClientAddr,
+    pub rooms: HashMap<String, RoomAddr>,
+}
+
+// impl ClientSession {
+//     pub async fn start(
+//         broker_addr: Sender<boker::MailboxMessage>,
+//     ) -> Result<ClientAddr, anyhow::Error> {
+//         let (client_addr, mailbox_rx) = mpsc::channel::<MailboxMessage>(CHANNEL_SIZE);
+//         let session_id = connect(client_addr.clone(), broker_addr.clone()).await?;
+
+//         let session = ClientSession { id: session_id };
+
+//         Ok(client_addr)
+//     }
 // }
 
-async fn send_heartbeat(tx: UnboundedSender<Message>) -> Result<(), anyhow::Error> {
-    let last_heartbeat = Instant::now();
-    loop {
-        if Instant::now().duration_since(last_heartbeat) > CLIENT_TIMEOUT {
-            // heartbeat timed out
-            warn!("Websocket Client heartbeat failed, disconnecting!");
-            // act.room_manager
-            //     .do_send(room_manager::Disconnect { id: act.id });
-            tx.send(Message::Close(None))?;
-            break;
-        } else {
-            tx.send(Message::Ping(b"".to_vec()))?;
+#[warn(unreachable_patterns)]
+fn parse_ws_message(text: &str) -> Result<MailboxMessage, anyhow::Error> {
+    let text = std::str::from_utf8(text.as_bytes())?;
+    debug!("client sent str: {:?}", text);
+    let mailbox_msg = serde_json::from_str::<MailboxMessage>(text)
+        .map_err(|_| anyhow::anyhow!("Can't parse json"))?;
+    match mailbox_msg {
+        msg @ MailboxMessage::Chat { .. } | msg @ MailboxMessage::CreateRoom { .. } => Ok(msg),
+        _ => {
+            anyhow::bail!("Not allow message type: {}", text)
         }
-        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
     }
-    Ok(())
 }
 
 async fn handle_ws_messages(
-    sender: UnboundedSender<Message>,
-    receiver: &mut SplitStream<WebSocket>,
+    client_addr: ClientAddr,
+    mut ws_receiver: SplitStream<WebSocket>,
+    ws_sender: UnboundedSender<Message>,
 ) -> Result<(), anyhow::Error> {
-    while let Some(msg) = receiver.next().await {
-        if let Ok(msg) = msg {
-            match msg {
-                Message::Text(text) => {
-                    debug!("client sent str: {:?}", text);
-                    if let Err(_) = sender.send(Message::Text(text)) {
+    let mut last_heartbeat = Instant::now();
+    loop {
+        match timeout(HEARTBEAT_INTERVAL, ws_receiver.next()).await {
+            Ok(msg) => {
+                last_heartbeat = Instant::now();
+                match msg {
+                    Some(Ok(msg)) => match msg {
+                        Message::Text(text) => match parse_ws_message(&text) {
+                            Ok(mailbox_msg) => client_addr.send(mailbox_msg).await?,
+                            Err(err) => {
+                                ws_sender.send(
+                                    WsResponse::Error {
+                                        error: format!("Invalid message: error={err}, msg={text}"),
+                                    }
+                                    .into(),
+                                )?;
+                                warn!("Invalid message {}", text);
+                            }
+                        },
+                        Message::Binary(_) => {
+                            debug!("client sent binary data");
+                            break;
+                        }
+                        Message::Ping(_) => {
+                            debug!("socket ping");
+                        }
+                        Message::Pong(_) => {
+                            debug!("socket pong");
+                        }
+                        Message::Close(_) => {
+                            debug!("client disconnected");
+                            break;
+                        }
+                    },
+                    Some(Err(_err)) => {
+                        debug!("client disconnected");
                         break;
-                    };
-                }
-                Message::Binary(_) => {
-                    debug!("client sent binary data");
-                    break;
-                }
-                Message::Ping(_) => {
-                    debug!("socket ping");
-                }
-                Message::Pong(_) => {
-                    debug!("socket pong");
-                }
-                Message::Close(_) => {
-                    debug!("client disconnected");
-                    break;
+                    }
+                    None => break,
                 }
             }
-        } else {
-            debug!("client disconnected");
-            break;
+            Err(_elapsed) => {
+                if Instant::now().duration_since(last_heartbeat) > CLIENT_TIMEOUT {
+                    warn!("Websocket Client heartbeat failed, disconnecting!");
+                    ws_sender.send(Message::Close(None))?;
+                    break;
+                } else {
+                    ws_sender.send(Message::Ping(b"hb".to_vec()))?;
+                }
+            }
+        }
+    }
+    debug!("end socket received task");
+    Ok(())
+}
+
+async fn handle_mailbox_message(
+    mut session: ClientSession,
+    mut mailbox_rx: Receiver<MailboxMessage>,
+    broker_addr: BrokerAddr,
+    ws_sender: UnboundedSender<Message>,
+) -> Result<(), anyhow::Error> {
+    while let Some(msg) = mailbox_rx.recv().await {
+        match msg {
+            MailboxMessage::Chat { room, message } => {
+                ws_sender.send(Message::Text(format!("echoing {}", message)))?
+            }
+            MailboxMessage::CreateRoom { name } => {
+                let room_addr = {
+                    let (send, recv) = oneshot::channel();
+                    broker_addr
+                        .send(broker::MailboxMessage::CreateRoom {
+                            session_id: session.id,
+                            name: name.clone(),
+                            respond_to: send,
+                        })
+                        .await?;
+                    debug!("created room {}", name);
+                    recv.await?
+                };
+                let (send, recv) = oneshot::channel();
+                room_addr
+                    .send(room::MailboxMessage::Join {
+                        client_addr: session.addr.clone(),
+                        name: session.id.to_string(),
+                        respond_to: send,
+                    })
+                    .await
+                    .unwrap();
+                debug!("joined room {}", name);
+                let _ = session.rooms.insert(name.clone(), room_addr);
+                let room_state = recv.await?;
+                ws_sender.send(WsResponse::Room(room_state).into())?;
+            }
         }
     }
     Ok(())
 }
-
-async fn handle_mailbox_message(server_addr: Sender<server::MailboxMessage>) {}
 
 // utility to convert sink to sender, as sink can't be cloned
 fn sink_to_sender<S, Item>(mut sink: SplitSink<S, Item>) -> UnboundedSender<Item>
@@ -127,32 +210,30 @@ where
 }
 
 async fn connect(
-    server_addr: mpsc::Sender<server::MailboxMessage>,
+    client_addr: ClientAddr,
+    broker_addr: BrokerAddr,
 ) -> Result<SessionId, anyhow::Error> {
     let (send, recv) = oneshot::channel();
-    let msg = server::MailboxMessage::Connect { respond_to: send };
+    let msg = broker::MailboxMessage::Connect {
+        client_addr: client_addr,
+        respond_to: send,
+    };
 
-    server_addr.send(msg).await?;
+    broker_addr.send(msg).await?;
     Ok(recv.await?)
 }
 
-async fn disconnect(
-    session_id: SessionId,
-    server_addr: mpsc::Sender<server::MailboxMessage>,
-) -> Result<(), anyhow::Error> {
-    let msg = server::MailboxMessage::Disconnect {
+async fn disconnect(session_id: SessionId, broker_addr: BrokerAddr) -> Result<(), anyhow::Error> {
+    let msg = broker::MailboxMessage::Disconnect {
         session_id: session_id,
     };
-    server_addr.send(msg).await?;
+    broker_addr.send(msg).await?;
     Ok(())
 }
 
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    server_addr: Sender<server::MailboxMessage>,
-) -> impl IntoResponse {
+pub async fn ws_handler(ws: WebSocketUpgrade, broker_addr: BrokerAddr) -> impl IntoResponse {
     ws.on_upgrade(move |socket| {
-        handle_socket(socket, server_addr).map(|res| {
+        handle_socket(socket, broker_addr).map(|res| {
             if let Err(err) = res {
                 warn!("Error handling socket {}", err);
             }
@@ -160,30 +241,31 @@ pub async fn ws_handler(
     })
 }
 
-async fn handle_socket(
-    socket: WebSocket,
-    server_addr: Sender<server::MailboxMessage>,
-) -> Result<(), anyhow::Error> {
-    let (socket_sender, mut socket_receiver) = socket.split();
+async fn handle_socket(socket: WebSocket, broker_addr: BrokerAddr) -> Result<(), anyhow::Error> {
+    let (socket_sender, socket_receiver) = socket.split();
     let sender = sink_to_sender(socket_sender);
 
-    // This task will receive broadcast messages and send text message to our client.
-    let sender_hb = sender.clone();
-    let mut hearbeat_task = tokio::spawn(async move { send_heartbeat(sender_hb).await });
+    let (client_addr, mailbox_rx) = mpsc::channel::<MailboxMessage>(CHANNEL_SIZE);
+    let session_id = connect(client_addr.clone(), broker_addr.clone()).await?;
+    let session = ClientSession {
+        id: session_id,
+        addr: client_addr.clone(),
+        rooms: HashMap::new(),
+    };
 
-    let session_id = connect(server_addr.clone()).await?;
+    let mut mailbox_recv_task = spawn_and_log_error(handle_mailbox_message(
+        session,
+        mailbox_rx,
+        broker_addr.clone(),
+        sender.clone(),
+    ));
 
-    let (mailbox_tx, mut mailbox_rx) = mpsc::unbounded_channel::<MailboxMessage>();
-    let mut mailbox_recv_task = tokio::spawn(async move {
-        while let Some(msg) = mailbox_rx.recv().await {
-            // do something here
-        }
-    });
-
-    // This task will receive messages from client and send them to broadcast subscribers.
-    let mut socket_recv_task =
-        tokio::spawn(async move { handle_ws_messages(sender, &mut socket_receiver).await });
-    debug!("spawned recv_task and send_task");
+    let mut socket_recv_task = spawn_and_log_error(handle_ws_messages(
+        client_addr,
+        socket_receiver,
+        sender.clone(),
+    ));
+    debug!("spawned socket_recv_task and mailbox_recv_task");
 
     // If any one of the tasks exit, abort the other.
     tokio::select! {
@@ -191,9 +273,7 @@ async fn handle_socket(
         _ = (&mut socket_recv_task) => mailbox_recv_task.abort(),
     };
 
-    hearbeat_task.abort();
-
-    disconnect(session_id, server_addr).await?;
+    disconnect(session_id, broker_addr).await?;
     debug!("done, closing");
     Ok(())
 }
