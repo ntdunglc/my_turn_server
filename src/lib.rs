@@ -1,12 +1,11 @@
 use axum::{
-    extract::Extension,
     http::StatusCode,
     routing::{get, get_service},
     Router,
 };
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::mpsc::{self, Sender};
+
+
 use tower_http::{
     services::ServeDir,
     trace::{DefaultMakeSpan, TraceLayer},

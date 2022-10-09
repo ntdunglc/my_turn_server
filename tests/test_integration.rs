@@ -1,10 +1,10 @@
-use axum::{
-    body::Body,
-    http::{self, Request, StatusCode},
-};
+use axum::{body::Body, http::Request};
 use futures_util::{SinkExt, StreamExt};
-use my_turn::{broker::BrokerStats, create_app, room::RoomState, ws::WsResponse};
-use std::net::{SocketAddr, TcpListener};
+use my_turn::{broker::BrokerStats, create_app, room, room::RoomState, ws::WsResponse};
+use std::{
+    collections::HashSet,
+    net::{SocketAddr, TcpListener},
+};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::log::warn;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -99,50 +99,163 @@ async fn test_websocket() {
         }
     );
 
-    // client 1 create a room
-    stream_1
-        .send(Message::Text(
-            "{\"CreateRoom\":{\"name\":\"abc\"}}".to_string(),
-        ))
-        .await
-        .unwrap();
-    assert_frame_eq!(
-        stream_1,
-        WsResponse::Room(RoomState {
-            name: "abc".to_string()
-        })
-    );
+    // start client 3
+    let (mut stream_3, _) = connect_async(&ws_url).await.expect("Failed to connect");
     assert_eq!(
         get_stats(&addr).await,
         BrokerStats {
-            room_count: 1,
-            session_count: 2
+            room_count: 0,
+            session_count: 3
         }
     );
 
-    // client 1 create the same room
-    stream_2
+    // all clients try to join the same room
+    for stream in [&mut stream_1, &mut stream_2, &mut stream_3] {
+        stream
+            .send(Message::Text(
+                "{\"JoinRoom\":{\"room\":\"abc\"}}".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_frame_eq!(
+            stream,
+            WsResponse::Room(RoomState {
+                name: "abc".to_string(),
+                users: HashSet::new(),
+                turns: Vec::new()
+            })
+        );
+        assert_eq!(
+            get_stats(&addr).await,
+            BrokerStats {
+                room_count: 1,
+                session_count: 3
+            }
+        );
+    }
+
+    // client 1 and 2 register themselves with their names, client 2 only watch
+    stream_1
         .send(Message::Text(
-            "{\"CreateRoom\":{\"name\":\"abc\"}}".to_string(),
+            "{\"Register\":{\"room\":\"abc\", \"username\":\"client 1\"}}".to_string(),
         ))
         .await
         .unwrap();
-    assert_frame_eq!(
-        stream_2,
-        WsResponse::Room(RoomState {
-            name: "abc".to_string()
-        })
-    );
-    assert_eq!(
-        get_stats(&addr).await,
-        BrokerStats {
-            room_count: 1,
-            session_count: 2
-        }
-    );
+    let res = WsResponse::Room(RoomState {
+        name: "abc".to_string(),
+        users: HashSet::from(["client 1".to_string()]),
+        turns: Vec::new(),
+    });
+
+    for stream in [&mut stream_1, &mut stream_2, &mut stream_3] {
+        assert_frame_eq!(stream, res);
+    }
+    stream_2
+        .send(Message::Text(
+            "{\"Register\":{\"room\":\"abc\", \"username\":\"client 2\"}}".to_string(),
+        ))
+        .await
+        .unwrap();
+    let res = WsResponse::Room(RoomState {
+        name: "abc".to_string(),
+        users: HashSet::from(["client 1".to_string(), "client 2".to_string()]),
+        turns: Vec::new(),
+    });
+
+    for stream in [&mut stream_1, &mut stream_2, &mut stream_3] {
+        assert_frame_eq!(stream, res);
+    }
+
+    // client 1 send a chat message, everyone should receive it
+    stream_1
+        .send(Message::Text(
+            "{\"SendChat\":{\"room\":\"abc\", \"message\":\"my message\"}}".to_string(),
+        ))
+        .await
+        .unwrap();
+    let res = WsResponse::Chat(room::ChatNotification {
+        room: "abc".to_string(),
+        username: "client 1".to_string(),
+        message: "my message".to_string(),
+    });
+    for stream in [&mut stream_1, &mut stream_2, &mut stream_3] {
+        assert_frame_eq!(stream, res);
+    }
+
+    // client 1 and client 2 try to take their turns
+    stream_1
+        .send(Message::Text(
+            "{\"TakeTurn\":{\"room\":\"abc\"}}".to_string(),
+        ))
+        .await
+        .unwrap();
+    let res = WsResponse::Room(RoomState {
+        name: "abc".to_string(),
+        users: HashSet::from(["client 1".to_string(), "client 2".to_string()]),
+        turns: Vec::from(["client 1".to_string()]),
+    });
+    for stream in [&mut stream_1, &mut stream_2, &mut stream_3] {
+        assert_frame_eq!(stream, res);
+    }
+    stream_2
+        .send(Message::Text(
+            "{\"TakeTurn\":{\"room\":\"abc\"}}".to_string(),
+        ))
+        .await
+        .unwrap();
+    let res = WsResponse::Room(RoomState {
+        name: "abc".to_string(),
+        users: HashSet::from(["client 1".to_string(), "client 2".to_string()]),
+        turns: Vec::from(["client 1".to_string(), "client 2".to_string()]),
+    });
+    for stream in [&mut stream_1, &mut stream_2, &mut stream_3] {
+        assert_frame_eq!(stream, res);
+    }
+
+    // Take turn another time doesn't count
+    stream_2
+        .send(Message::Text(
+            "{\"TakeTurn\":{\"room\":\"abc\"}}".to_string(),
+        ))
+        .await
+        .unwrap();
+    let res = WsResponse::Room(RoomState {
+        name: "abc".to_string(),
+        users: HashSet::from(["client 1".to_string(), "client 2".to_string()]),
+        turns: Vec::from(["client 1".to_string(), "client 2".to_string()]),
+    });
+    for stream in [&mut stream_1, &mut stream_2, &mut stream_3] {
+        assert_frame_eq!(stream, res);
+    }
+
+    // Reset turn for the next round
+    stream_2
+        .send(Message::Text(
+            "{\"ResetTurn\":{\"room\":\"abc\"}}".to_string(),
+        ))
+        .await
+        .unwrap();
+    let res = WsResponse::Room(RoomState {
+        name: "abc".to_string(),
+        users: HashSet::from(["client 1".to_string(), "client 2".to_string()]),
+        turns: Vec::new(),
+    });
+    for stream in [&mut stream_1, &mut stream_2, &mut stream_3] {
+        assert_frame_eq!(stream, res);
+    }
 
     // stop client 1
     drop(stream_1);
+    assert_eq!(
+        get_stats(&addr).await,
+        BrokerStats {
+            room_count: 1,
+            session_count: 2
+        }
+    );
+
+    // stop client 2
+    drop(stream_2);
     assert_eq!(
         get_stats(&addr).await,
         BrokerStats {
@@ -152,7 +265,7 @@ async fn test_websocket() {
     );
 
     // stop client 2
-    drop(stream_2);
+    drop(stream_3);
     assert_eq!(
         get_stats(&addr).await,
         BrokerStats {

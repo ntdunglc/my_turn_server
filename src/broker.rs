@@ -1,13 +1,10 @@
 use crate::{
-    room::{self, Room, RoomAddr, WeakRoomAddr},
+    room::{Room, RoomAddr, WeakRoomAddr},
     utils::spawn_and_log_error,
-    ws::{self, ClientAddr, SessionId},
+    ws::{ClientAddr, SessionId},
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{hash_map::Entry, HashMap};
 use tokio::{
     sync::{
         mpsc::{self, Receiver},
@@ -34,13 +31,13 @@ pub enum MailboxMessage {
     Disconnect {
         session_id: SessionId,
     },
-    CreateRoom {
+    JoinRoom {
         session_id: SessionId,
-        name: String,
+        room: String,
         respond_to: oneshot::Sender<RoomAddr>,
     },
     CloseRoom {
-        name: String,
+        room: String,
     },
     Stats {
         respond_to: oneshot::Sender<BrokerStats>,
@@ -52,10 +49,11 @@ pub type BrokerAddr = mpsc::Sender<MailboxMessage>;
 #[derive(Debug)]
 pub struct RoomState {
     room_addr: WeakRoomAddr,
-    handle: JoinHandle<()>,
 }
+
 #[derive(Debug)]
 pub struct SessionState {
+    #[allow(dead_code)] // could be useful for server announcement/shutdown
     client_addr: ClientAddr,
 }
 
@@ -99,9 +97,9 @@ impl Broker {
                 Disconnect { session_id } => {
                     let _ = self.sessions.remove(&session_id);
                 }
-                CreateRoom {
-                    session_id,
-                    name,
+                JoinRoom {
+                    session_id: _,
+                    room: name,
                     respond_to,
                 } => {
                     let room_addr_opt: Option<RoomAddr> = match self.rooms.entry(name.clone()) {
@@ -109,14 +107,13 @@ impl Broker {
                             debug!("broker: Found room, reuse");
                             entry.get().room_addr.clone().upgrade()
                         }
-                        Entry::Vacant(vacant) => None,
+                        Entry::Vacant(_vacant) => None,
                     };
                     if room_addr_opt.is_none() {
-                        let (room_addr, handle) = Room::spawn(name.clone(), self.addr.clone());
+                        let (room_addr, _handle) = Room::spawn(name.clone(), self.addr.clone());
                         debug!("broker: Room created");
                         let room_state = RoomState {
                             room_addr: room_addr.downgrade(),
-                            handle,
                         };
                         let _ = self.rooms.insert(name, room_state);
                         let _ = respond_to.send(room_addr);
@@ -124,7 +121,7 @@ impl Broker {
                         let _ = respond_to.send(room_addr_opt.unwrap());
                     }
                 }
-                CloseRoom { name } => {
+                CloseRoom { room: name } => {
                     let room_addr_opt: Option<RoomAddr> = match self.rooms.entry(name.clone()) {
                         Entry::Occupied(entry) => {
                             debug!("broker: Found room, reuse");

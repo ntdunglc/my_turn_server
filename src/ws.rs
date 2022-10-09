@@ -13,7 +13,7 @@ use futures_util::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Debug, time::Duration};
-use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Instant};
 use tracing::log::{debug, warn};
@@ -26,11 +26,17 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(16);
 
 // Input message of ClientSession
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MailboxMessage {
-    CreateRoom { name: String },
-    // Vote { room: String },
-    Chat { room: String, message: String },
+    // messages from client
+    JoinRoom { room: String },
+    Register { room: String, username: String },
+    SendChat { room: String, message: String },
+    TakeTurn { room: String },
+    ResetTurn { room: String },
+    // messages from room
+    RoomNotification(room::RoomState),
+    ChatNotification(room::ChatNotification),
 }
 
 pub type ClientAddr = mpsc::Sender<MailboxMessage>;
@@ -40,7 +46,7 @@ pub type ClientAddr = mpsc::Sender<MailboxMessage>;
 pub enum WsResponse {
     ClientState { id: SessionId },
     Room(room::RoomState),
-    // Chat { message: String },
+    Chat(room::ChatNotification),
     Error { error: String },
 }
 
@@ -57,19 +63,6 @@ pub struct ClientSession {
     pub rooms: HashMap<String, RoomAddr>,
 }
 
-// impl ClientSession {
-//     pub async fn start(
-//         broker_addr: Sender<boker::MailboxMessage>,
-//     ) -> Result<ClientAddr, anyhow::Error> {
-//         let (client_addr, mailbox_rx) = mpsc::channel::<MailboxMessage>(CHANNEL_SIZE);
-//         let session_id = connect(client_addr.clone(), broker_addr.clone()).await?;
-
-//         let session = ClientSession { id: session_id };
-
-//         Ok(client_addr)
-//     }
-// }
-
 #[warn(unreachable_patterns)]
 fn parse_ws_message(text: &str) -> Result<MailboxMessage, anyhow::Error> {
     let text = std::str::from_utf8(text.as_bytes())?;
@@ -77,7 +70,11 @@ fn parse_ws_message(text: &str) -> Result<MailboxMessage, anyhow::Error> {
     let mailbox_msg = serde_json::from_str::<MailboxMessage>(text)
         .map_err(|_| anyhow::anyhow!("Can't parse json"))?;
     match mailbox_msg {
-        msg @ MailboxMessage::Chat { .. } | msg @ MailboxMessage::CreateRoom { .. } => Ok(msg),
+        msg @ MailboxMessage::SendChat { .. }
+        | msg @ MailboxMessage::JoinRoom { .. }
+        | msg @ MailboxMessage::TakeTurn { .. }
+        | msg @ MailboxMessage::ResetTurn { .. }
+        | msg @ MailboxMessage::Register { .. } => Ok(msg),
         _ => {
             anyhow::bail!("Not allow message type: {}", text)
         }
@@ -153,35 +150,71 @@ async fn handle_mailbox_message(
 ) -> Result<(), anyhow::Error> {
     while let Some(msg) = mailbox_rx.recv().await {
         match msg {
-            MailboxMessage::Chat { room, message } => {
-                ws_sender.send(Message::Text(format!("echoing {}", message)))?
-            }
-            MailboxMessage::CreateRoom { name } => {
+            MailboxMessage::JoinRoom { room: name } => {
                 let room_addr = {
                     let (send, recv) = oneshot::channel();
                     broker_addr
-                        .send(broker::MailboxMessage::CreateRoom {
+                        .send(broker::MailboxMessage::JoinRoom {
                             session_id: session.id,
-                            name: name.clone(),
+                            room: name.clone(),
                             respond_to: send,
                         })
                         .await?;
                     debug!("created room {}", name);
                     recv.await?
                 };
-                let (send, recv) = oneshot::channel();
                 room_addr
                     .send(room::MailboxMessage::Join {
+                        session_id: session.id,
                         client_addr: session.addr.clone(),
-                        name: session.id.to_string(),
-                        respond_to: send,
                     })
-                    .await
-                    .unwrap();
+                    .await?;
                 debug!("joined room {}", name);
                 let _ = session.rooms.insert(name.clone(), room_addr);
-                let room_state = recv.await?;
-                ws_sender.send(WsResponse::Room(room_state).into())?;
+            }
+            MailboxMessage::Register { room, username } => {
+                if let Some(room_addr) = session.rooms.get(&room) {
+                    room_addr
+                        .send(room::MailboxMessage::Register {
+                            session_id: session.id,
+                            username: username,
+                        })
+                        .await?;
+                }
+            }
+            MailboxMessage::SendChat { room, message } => {
+                if let Some(room_addr) = session.rooms.get(&room) {
+                    room_addr
+                        .send(room::MailboxMessage::Chat {
+                            session_id: session.id,
+                            message: message,
+                        })
+                        .await?;
+                }
+            }
+            MailboxMessage::TakeTurn { room } => {
+                if let Some(room_addr) = session.rooms.get(&room) {
+                    room_addr
+                        .send(room::MailboxMessage::TakeTurn {
+                            session_id: session.id,
+                        })
+                        .await?;
+                }
+            }
+            MailboxMessage::ResetTurn { room } => {
+                if let Some(room_addr) = session.rooms.get(&room) {
+                    room_addr
+                        .send(room::MailboxMessage::ResetTurn {
+                            session_id: session.id,
+                        })
+                        .await?;
+                }
+            }
+            MailboxMessage::RoomNotification(room) => {
+                ws_sender.send(WsResponse::Room(room).into())?;
+            }
+            MailboxMessage::ChatNotification(chat) => {
+                ws_sender.send(WsResponse::Chat(chat).into())?;
             }
         }
     }
@@ -193,12 +226,13 @@ fn sink_to_sender<S, Item>(mut sink: SplitSink<S, Item>) -> UnboundedSender<Item
 where
     SplitSink<S, Item>: SinkExt<Item> + Send + 'static,
     <SplitSink<S, Item> as futures_util::Sink<Item>>::Error: Debug,
-    Item: Send + Sync,
+    Item: Send + Sync + Debug,
 {
     let (tx, mut rx) = mpsc::unbounded_channel::<Item>();
 
     tokio::task::spawn(async move {
         while let Some(msg) = rx.recv().await {
+            debug!("Server sending {:?}", &msg);
             // In any websocket error, break loop.
             if let Err(e) = sink.send(msg).await {
                 warn!("websocket send error: {:?}", e);
@@ -273,6 +307,7 @@ async fn handle_socket(socket: WebSocket, broker_addr: BrokerAddr) -> Result<(),
         _ = (&mut socket_recv_task) => mailbox_recv_task.abort(),
     };
 
+    // no need to tell the room, as if client quit, room will automatically remove it
     disconnect(session_id, broker_addr).await?;
     debug!("done, closing");
     Ok(())
