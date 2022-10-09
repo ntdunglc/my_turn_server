@@ -1,14 +1,13 @@
 use crate::{
+    actor::{Actor, Mailbox},
     broker::{self, BrokerAddr},
-    ws::{self, ClientAddr, SessionId},
+    user_session::{self, SessionId, UserSessionAddr},
 };
 use futures::TryFutureExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::sync::mpsc::{self};
 use tracing::log::debug;
-
-const CHANNEL_SIZE: usize = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RoomState {
@@ -27,7 +26,7 @@ pub struct ChatNotification {
 pub enum MailboxMessage {
     Join {
         session_id: SessionId,
-        client_addr: ClientAddr,
+        client_addr: UserSessionAddr,
     }, // client can just join and watch
     // user needs to register with an room's username before they can participate
     Chat {
@@ -52,13 +51,33 @@ pub type WeakRoomAddr = mpsc::WeakSender<MailboxMessage>;
 pub struct Room {
     state: RoomState,
     broker_addr: BrokerAddr,
-    sessions: HashMap<SessionId, ClientAddr>,
+    sessions: HashMap<SessionId, UserSessionAddr>,
     registered_users: HashMap<SessionId, String>,
 }
 
+#[async_trait::async_trait]
+impl Actor for Room {
+    type MailboxMessage = MailboxMessage;
+
+    async fn run(mut self: Self, mut mailbox: Mailbox<Self::MailboxMessage>) -> anyhow::Result<()> {
+        debug!("room: Room created");
+        while let Some(msg) = mailbox.receiver.recv().await {
+            self.handle_message(msg).await;
+        }
+        debug!("Room closing");
+        let _ = self
+            .broker_addr
+            .send(broker::MailboxMessage::CloseRoom {
+                room: self.state.name.clone(),
+            })
+            .await;
+        Ok(())
+    }
+}
+
 impl Room {
-    pub fn spawn(name: String, broker_addr: BrokerAddr) -> (RoomAddr, JoinHandle<()>) {
-        let mut room = Room {
+    pub fn new(name: String, broker_addr: BrokerAddr) -> Room {
+        Room {
             state: RoomState {
                 name,
                 users: HashSet::new(),
@@ -67,22 +86,7 @@ impl Room {
             broker_addr,
             sessions: HashMap::new(),
             registered_users: HashMap::new(),
-        };
-        let (tx, mut rx) = mpsc::channel::<MailboxMessage>(CHANNEL_SIZE);
-        let handle = tokio::task::spawn(async move {
-            debug!("room: Room created");
-            while let Some(msg) = rx.recv().await {
-                room.handle_message(msg).await;
-            }
-            debug!("Room closing");
-            let _ = room
-                .broker_addr
-                .send(broker::MailboxMessage::CloseRoom {
-                    room: room.state.name.clone(),
-                })
-                .await;
-        });
-        (tx, handle)
+        }
     }
 
     pub async fn handle_message(&mut self, message: MailboxMessage) {
@@ -93,7 +97,9 @@ impl Room {
                 client_addr,
             } => {
                 let _ = client_addr
-                    .send(ws::MailboxMessage::RoomNotification(self.state.clone()))
+                    .send(user_session::MailboxMessage::RoomNotification(
+                        self.state.clone(),
+                    ))
                     .await;
                 let _ = self.sessions.insert(session_id, client_addr);
             }
@@ -134,21 +140,25 @@ impl Room {
     }
 
     async fn broadcast_chat(&mut self, username: String, message: String) {
-        self.broadcast(ws::MailboxMessage::ChatNotification(ChatNotification {
-            room: self.state.name.clone(),
-            username: username,
-            message: message,
-        }))
+        self.broadcast(user_session::MailboxMessage::ChatNotification(
+            ChatNotification {
+                room: self.state.name.clone(),
+                username: username,
+                message: message,
+            },
+        ))
         .await;
     }
 
     async fn broadcast_state(&mut self) {
-        self.broadcast(ws::MailboxMessage::RoomNotification(self.state.clone()))
-            .await;
+        self.broadcast(user_session::MailboxMessage::RoomNotification(
+            self.state.clone(),
+        ))
+        .await;
     }
 
     // broadcast will remove closed sessions
-    async fn broadcast(&mut self, message: ws::MailboxMessage) {
+    async fn broadcast(&mut self, message: user_session::MailboxMessage) {
         let mut handles = vec![];
         for (session_id, client_addr) in self.sessions.iter() {
             handles.push(

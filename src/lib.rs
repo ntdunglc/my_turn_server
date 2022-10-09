@@ -5,20 +5,22 @@ use axum::{
 };
 use std::path::PathBuf;
 
-
 use tower_http::{
     services::ServeDir,
     trace::{DefaultMakeSpan, TraceLayer},
 };
+pub mod actor;
 pub mod broker;
 pub mod error;
 pub mod room;
 pub mod stats;
+pub mod user_session;
 pub mod utils;
 pub mod ws;
+use actor::Actor;
 
 pub fn create_app() -> Router {
-    let (broker_addr, _) = broker::Broker::spawn();
+    let broker_addr = broker::Broker::new().spawn();
     let broker_addr_2 = broker_addr.clone();
     let assets_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
     Router::new()

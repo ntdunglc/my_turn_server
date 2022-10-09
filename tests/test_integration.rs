@@ -1,6 +1,6 @@
 use axum::{body::Body, http::Request};
 use futures_util::{SinkExt, StreamExt};
-use my_turn::{broker::BrokerStats, create_app, room, room::RoomState, ws::WsResponse};
+use my_turn::{broker::BrokerStats, create_app, room, room::RoomState, ws};
 use std::{
     collections::HashSet,
     net::{SocketAddr, TcpListener},
@@ -54,7 +54,7 @@ macro_rules! assert_frame_eq {
         let item = $stream.next().await.unwrap().unwrap();
         if let Message::Text(text) = item {
             let text = std::str::from_utf8(text.as_bytes()).unwrap();
-            let parsed_res = serde_json::from_str::<WsResponse>(text).unwrap();
+            let parsed_res = serde_json::from_str::<ws::writer::MailboxMessage>(text).unwrap();
             assert_eq!(parsed_res, $response);
         } else {
             warn!("item={}", item);
@@ -77,7 +77,7 @@ async fn test_websocket() {
         .unwrap();
     assert_frame_eq!(
         stream_1,
-        WsResponse::Error {
+        ws::writer::MailboxMessage::Error {
             error: "Invalid message: error=Can't parse json, msg=Ok".to_string()
         }
     );
@@ -119,7 +119,7 @@ async fn test_websocket() {
             .unwrap();
         assert_frame_eq!(
             stream,
-            WsResponse::Room(RoomState {
+            ws::writer::MailboxMessage::Room(RoomState {
                 name: "abc".to_string(),
                 users: HashSet::new(),
                 turns: Vec::new()
@@ -134,14 +134,14 @@ async fn test_websocket() {
         );
     }
 
-    // client 1 and 2 register themselves with their names, client 2 only watch
+    // client 1 and 2 register themselves with their names, client 3 only watch
     stream_1
         .send(Message::Text(
             "{\"Register\":{\"room\":\"abc\", \"username\":\"client 1\"}}".to_string(),
         ))
         .await
         .unwrap();
-    let res = WsResponse::Room(RoomState {
+    let res = ws::writer::MailboxMessage::Room(RoomState {
         name: "abc".to_string(),
         users: HashSet::from(["client 1".to_string()]),
         turns: Vec::new(),
@@ -156,7 +156,7 @@ async fn test_websocket() {
         ))
         .await
         .unwrap();
-    let res = WsResponse::Room(RoomState {
+    let res = ws::writer::MailboxMessage::Room(RoomState {
         name: "abc".to_string(),
         users: HashSet::from(["client 1".to_string(), "client 2".to_string()]),
         turns: Vec::new(),
@@ -173,7 +173,7 @@ async fn test_websocket() {
         ))
         .await
         .unwrap();
-    let res = WsResponse::Chat(room::ChatNotification {
+    let res = ws::writer::MailboxMessage::Chat(room::ChatNotification {
         room: "abc".to_string(),
         username: "client 1".to_string(),
         message: "my message".to_string(),
@@ -189,7 +189,7 @@ async fn test_websocket() {
         ))
         .await
         .unwrap();
-    let res = WsResponse::Room(RoomState {
+    let res = ws::writer::MailboxMessage::Room(RoomState {
         name: "abc".to_string(),
         users: HashSet::from(["client 1".to_string(), "client 2".to_string()]),
         turns: Vec::from(["client 1".to_string()]),
@@ -203,7 +203,7 @@ async fn test_websocket() {
         ))
         .await
         .unwrap();
-    let res = WsResponse::Room(RoomState {
+    let res = ws::writer::MailboxMessage::Room(RoomState {
         name: "abc".to_string(),
         users: HashSet::from(["client 1".to_string(), "client 2".to_string()]),
         turns: Vec::from(["client 1".to_string(), "client 2".to_string()]),
@@ -219,7 +219,7 @@ async fn test_websocket() {
         ))
         .await
         .unwrap();
-    let res = WsResponse::Room(RoomState {
+    let res = ws::writer::MailboxMessage::Room(RoomState {
         name: "abc".to_string(),
         users: HashSet::from(["client 1".to_string(), "client 2".to_string()]),
         turns: Vec::from(["client 1".to_string(), "client 2".to_string()]),
@@ -235,7 +235,7 @@ async fn test_websocket() {
         ))
         .await
         .unwrap();
-    let res = WsResponse::Room(RoomState {
+    let res = ws::writer::MailboxMessage::Room(RoomState {
         name: "abc".to_string(),
         users: HashSet::from(["client 1".to_string(), "client 2".to_string()]),
         turns: Vec::new(),
@@ -264,7 +264,7 @@ async fn test_websocket() {
         }
     );
 
-    // stop client 2
+    // stop client 3
     drop(stream_3);
     assert_eq!(
         get_stats(&addr).await,

@@ -1,20 +1,15 @@
 use crate::{
+    actor::{Actor, Mailbox},
     room::{Room, RoomAddr, WeakRoomAddr},
-    utils::spawn_and_log_error,
-    ws::{ClientAddr, SessionId},
+    user_session::{SessionId, UserSessionAddr},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::Entry, HashMap};
-use tokio::{
-    sync::{
-        mpsc::{self, Receiver},
-        oneshot,
-    },
-    task::JoinHandle,
+use tokio::sync::{
+    mpsc::{self},
+    oneshot,
 };
 use tracing::log::{debug, warn};
-
-const CHANNEL_SIZE: usize = 60;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct BrokerStats {
@@ -25,7 +20,7 @@ pub struct BrokerStats {
 #[derive(Debug)]
 pub enum MailboxMessage {
     Connect {
-        client_addr: ClientAddr,
+        client_addr: UserSessionAddr,
         respond_to: oneshot::Sender<SessionId>,
     },
     Disconnect {
@@ -47,49 +42,27 @@ pub enum MailboxMessage {
 pub type BrokerAddr = mpsc::Sender<MailboxMessage>;
 
 #[derive(Debug)]
-pub struct RoomState {
-    room_addr: WeakRoomAddr,
-}
-
-#[derive(Debug)]
-pub struct SessionState {
-    #[allow(dead_code)] // could be useful for server announcement/shutdown
-    client_addr: ClientAddr,
-}
-
-#[derive(Debug)]
 pub struct Broker {
     max_session_id: SessionId,
-    sessions: HashMap<SessionId, SessionState>,
-    rooms: HashMap<String, RoomState>,
-    addr: BrokerAddr,
+    sessions: HashMap<SessionId, UserSessionAddr>,
+    rooms: HashMap<String, WeakRoomAddr>,
 }
 
-impl Broker {
-    pub fn spawn() -> (BrokerAddr, JoinHandle<()>) {
-        let (tx, rx) = mpsc::channel::<MailboxMessage>(CHANNEL_SIZE);
-        let broker = Broker {
-            max_session_id: 0,
-            sessions: HashMap::new(),
-            rooms: HashMap::new(),
-            addr: tx.clone(),
-        };
-        let handle = spawn_and_log_error(broker.handle_messages(rx));
-        (tx, handle)
-    }
+#[async_trait::async_trait]
+impl Actor for Broker {
+    type MailboxMessage = MailboxMessage;
+    const CHANNEL_SIZE: usize = 100;
 
-    pub async fn handle_messages(mut self, mut rx: Receiver<MailboxMessage>) -> anyhow::Result<()> {
+    async fn run(mut self: Self, mut mailbox: Mailbox<Self::MailboxMessage>) -> anyhow::Result<()> {
         use MailboxMessage::*;
-        // server should never stop
-        while let Some(message) = rx.recv().await {
+        while let Some(message) = mailbox.receiver.recv().await {
             match message {
                 Connect {
                     client_addr,
                     respond_to,
                 } => {
                     self.max_session_id += 1;
-                    self.sessions
-                        .insert(self.max_session_id, SessionState { client_addr });
+                    self.sessions.insert(self.max_session_id, client_addr);
                     if let Err(err) = respond_to.send(self.max_session_id) {
                         warn!("Error on client connect: {}", err)
                     }
@@ -105,18 +78,20 @@ impl Broker {
                     let room_addr_opt: Option<RoomAddr> = match self.rooms.entry(name.clone()) {
                         Entry::Occupied(entry) => {
                             debug!("broker: Found room, reuse");
-                            entry.get().room_addr.clone().upgrade()
+                            entry.get().clone().upgrade()
                         }
                         Entry::Vacant(_vacant) => None,
                     };
                     if room_addr_opt.is_none() {
-                        let (room_addr, _handle) = Room::spawn(name.clone(), self.addr.clone());
-                        debug!("broker: Room created");
-                        let room_state = RoomState {
-                            room_addr: room_addr.downgrade(),
-                        };
-                        let _ = self.rooms.insert(name, room_state);
-                        let _ = respond_to.send(room_addr);
+                        match mailbox.sender() {
+                            Some(sender) => {
+                                let room_addr = Room::new(name.clone(), sender).spawn();
+                                debug!("broker: Room created");
+                                let _ = self.rooms.insert(name, room_addr.downgrade());
+                                let _ = respond_to.send(room_addr);
+                            }
+                            None => return Ok(()), // channel is dropped, quit
+                        }
                     } else {
                         let _ = respond_to.send(room_addr_opt.unwrap());
                     }
@@ -125,7 +100,7 @@ impl Broker {
                     let room_addr_opt: Option<RoomAddr> = match self.rooms.entry(name.clone()) {
                         Entry::Occupied(entry) => {
                             debug!("broker: Found room, reuse");
-                            entry.get().room_addr.clone().upgrade()
+                            entry.get().clone().upgrade()
                         }
                         Entry::Vacant(_) => None,
                     };
@@ -144,5 +119,15 @@ impl Broker {
             }
         }
         Ok(())
+    }
+}
+
+impl Broker {
+    pub fn new() -> Broker {
+        Broker {
+            max_session_id: 0,
+            sessions: HashMap::new(),
+            rooms: HashMap::new(),
+        }
     }
 }
